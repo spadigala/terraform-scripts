@@ -1,0 +1,313 @@
+# Provider Configuration
+terraform {
+  required_providers {
+    oci = {
+      source  = "oracle/oci"
+      version = "~> 4.0"
+    }
+  }
+}
+
+provider "oci" {
+  tenancy_ocid     = var.tenancy_ocid
+  user_ocid        = var.user_ocid
+  fingerprint      = var.fingerprint
+  private_key_path = var.private_key_path
+  region           = var.region
+}
+
+# Variables
+variable "tenancy_ocid" {}
+variable "user_ocid" {}
+variable "fingerprint" {}
+variable "private_key_path" {}
+variable "region" {}
+variable "admin_email" {
+  description = "Email address for admin user"
+  type        = string
+}
+variable "dev_email" {
+  description = "Email address for developer user"
+  type        = string
+}
+
+# Root Compartment
+resource "oci_identity_compartment" "zero_trust_compartment" {
+  name           = "zero-trust-compartment"
+  description    = "Compartment for Zero Trust Infrastructure"
+  compartment_id = var.tenancy_ocid
+  enable_delete  = true
+}
+
+# Identity Management
+resource "oci_identity_group" "admin_group" {
+  name           = "zero-trust-admins"
+  description    = "Administrators for Zero Trust Infrastructure"
+  compartment_id = var.tenancy_ocid
+}
+
+resource "oci_identity_group" "dev_group" {
+  name           = "zero-trust-developers"
+  description    = "Developers for Zero Trust Infrastructure"
+  compartment_id = var.tenancy_ocid
+}
+
+resource "oci_identity_user" "admin_user" {
+  name           = "zt-admin"
+  description    = "Administrator for Zero Trust Infrastructure"
+  compartment_id = var.tenancy_ocid
+  email         = var.admin_email
+}
+
+resource "oci_identity_user" "dev_user" {
+  name           = "zt-developer"
+  description    = "Developer for Zero Trust Infrastructure"
+  compartment_id = var.tenancy_ocid
+  email         = var.dev_email
+}
+
+# Group Memberships
+resource "oci_identity_user_group_membership" "admin_membership" {
+  group_id = oci_identity_group.admin_group.id
+  user_id  = oci_identity_user.admin_user.id
+}
+
+resource "oci_identity_user_group_membership" "dev_membership" {
+  group_id = oci_identity_group.dev_group.id
+  user_id  = oci_identity_user.dev_user.id
+}
+
+# Network Configuration
+resource "oci_core_vcn" "zero_trust_vcn" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  cidr_blocks    = ["10.0.0.0/16"]
+  display_name   = "ZeroTrustVCN"
+  dns_label      = "zerotrust"
+  is_ipv6enabled = true
+}
+
+# Subnets
+resource "oci_core_subnet" "private_subnet" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  cidr_block     = "10.0.1.0/24"
+  display_name   = "PrivateSubnet"
+  dns_label      = "private"
+  
+  prohibit_public_ip_on_vnic = true
+  route_table_id             = oci_core_route_table.private_route_table.id
+  security_list_ids          = [oci_core_security_list.private_security_list.id]
+}
+
+resource "oci_core_subnet" "bastion_subnet" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  cidr_block     = "10.0.2.0/24"
+  display_name   = "BastionSubnet"
+  dns_label      = "bastion"
+  
+  prohibit_public_ip_on_vnic = false
+  route_table_id             = oci_core_route_table.public_route_table.id
+  security_list_ids          = [oci_core_security_list.bastion_security_list.id]
+}
+
+# Gateways
+resource "oci_core_internet_gateway" "igw" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  display_name   = "InternetGateway"
+  enabled        = true
+}
+
+resource "oci_core_nat_gateway" "nat" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  display_name   = "NATGateway"
+}
+
+resource "oci_core_service_gateway" "sg" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  display_name   = "ServiceGateway"
+  
+  services {
+    service_id = data.oci_core_services.all_services.services[0].id
+  }
+}
+
+# Route Tables
+resource "oci_core_route_table" "private_route_table" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  display_name   = "PrivateRouteTable"
+
+  route_rules {
+    destination       = "0.0.0.0/0"
+    destination_type  = "CIDR_BLOCK"
+    network_entity_id = oci_core_nat_gateway.nat.id
+  }
+
+  route_rules {
+    destination       = data.oci_core_services.all_services.services[0].cidr_block
+    destination_type  = "SERVICE_CIDR_BLOCK"
+    network_entity_id = oci_core_service_gateway.sg.id
+  }
+}
+
+resource "oci_core_route_table" "public_route_table" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  display_name   = "PublicRouteTable"
+
+  route_rules {
+    destination       = "0.0.0.0/0"
+    destination_type  = "CIDR_BLOCK"
+    network_entity_id = oci_core_internet_gateway.igw.id
+  }
+}
+
+# Security Lists
+resource "oci_core_security_list" "private_security_list" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  display_name   = "PrivateSecurityList"
+
+  egress_security_rules {
+    destination = "0.0.0.0/0"
+    protocol    = "all"
+    stateless   = false
+  }
+
+  ingress_security_rules {
+    protocol  = "6" # TCP
+    source    = "10.0.2.0/24"
+    stateless = false
+
+    tcp_options {
+      min = 22
+      max = 22
+    }
+  }
+}
+
+resource "oci_core_security_list" "bastion_security_list" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  display_name   = "BastionSecurityList"
+
+  egress_security_rules {
+    destination = "10.0.1.0/24"
+    protocol    = "6"
+    stateless   = false
+    
+    tcp_options {
+      min = 22
+      max = 22
+    }
+  }
+
+  ingress_security_rules {
+    protocol  = "6"
+    source    = var.trusted_ip_range
+    stateless = false
+
+    tcp_options {
+      min = 22
+      max = 22
+    }
+  }
+}
+
+# Network Security Groups
+resource "oci_core_network_security_group" "app_nsg" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  vcn_id         = oci_core_vcn.zero_trust_vcn.id
+  display_name   = "ApplicationNSG"
+}
+
+# Bastion Service
+resource "oci_bastion_bastion" "zero_trust_bastion" {
+  bastion_type                 = "STANDARD"
+  compartment_id               = oci_identity_compartment.zero_trust_compartment.id
+  target_subnet_id             = oci_core_subnet.bastion_subnet.id
+  client_cidr_block_allow_list = [var.trusted_ip_range]
+  name                         = "ZeroTrustBastion"
+  max_session_ttl_in_seconds   = 10800
+}
+
+# Cloud Guard
+resource "oci_cloud_guard_configuration" "cloud_guard" {
+  compartment_id   = oci_identity_compartment.zero_trust_compartment.id
+  status          = "ENABLED"
+  reporting_region = var.region
+}
+
+# Vault
+resource "oci_kms_vault" "security_vault" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  display_name   = "SecurityVault"
+  vault_type     = "DEFAULT"
+}
+
+# WAF
+resource "oci_waas_waas_policy" "web_app_firewall" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  display_name   = "ZeroTrustWAF"
+  domain {
+    domain = "example.com"
+  }
+}
+
+# Logging
+resource "oci_logging_log_group" "log_group" {
+  compartment_id = oci_identity_compartment.zero_trust_compartment.id
+  display_name   = "ZeroTrustLogs"
+}
+
+resource "oci_logging_log" "vcn_flow_log" {
+  display_name = "VCNFlowLog"
+  log_group_id = oci_logging_log_group.log_group.id
+  log_type     = "SERVICE"
+  
+  configuration {
+    source {
+      category    = "all"
+      resource    = oci_core_vcn.zero_trust_vcn.id
+      service     = "flowlogs"
+      source_type = "OCISERVICE"
+    }
+  }
+  
+  retention_duration = 90
+  is_enabled        = true
+}
+
+# Data Sources
+data "oci_core_services" "all_services" {
+  filter {
+    name   = "name"
+    values = ["All .* Services In Oracle Services Network"]
+    regex  = true
+  }
+}
+
+# Outputs
+output "compartment_id" {
+  value = oci_identity_compartment.zero_trust_compartment.id
+}
+
+output "vcn_id" {
+  value = oci_core_vcn.zero_trust_vcn.id
+}
+
+output "private_subnet_id" {
+  value = oci_core_subnet.private_subnet.id
+}
+
+output "bastion_subnet_id" {
+  value = oci_core_subnet.bastion_subnet.id
+}
+
+output "vault_id" {
+  value = oci_kms_vault.security_vault.id
+}
